@@ -1,6 +1,11 @@
 import * as os from 'os';
-import { Utils, DownloadDetails, JfrogCredentials } from '../src/utils';
+import * as core from '@actions/core';
+
+import { Utils, DownloadDetails, JfrogCredentials, JWTTokenData } from '../src/utils';
+import semver = require('semver/preload');
 jest.mock('os');
+jest.mock('@actions/core');
+jest.mock('semver');
 
 const DEFAULT_CLI_URL: string = 'https://releases.jfrog.io/artifactory/jfrog-cli/';
 const CUSTOM_CLI_URL: string = 'http://127.0.0.1:8081/artifactory/jfrog-cli-remote/';
@@ -164,11 +169,11 @@ describe('JFrog CLI V1 URL Tests', () => {
     test.each(cases)('CLI Url for %s-%s', (platform, arch, fileName, expectedUrl) => {
         myOs.platform.mockImplementation(() => <NodeJS.Platform>platform);
         myOs.arch.mockImplementation(() => arch);
-        let cliUrl: string = Utils.getCliUrl('1', '1.2.3', fileName, Utils.DEFAULT_DOWNLOAD_DETAILS);
+        let cliUrl: string = Utils.getCliUrl('1.2.3', fileName, Utils.DEFAULT_DOWNLOAD_DETAILS);
         expect(cliUrl).toBe(DEFAULT_CLI_URL + expectedUrl);
 
         process.env.JF_ENV_LOCAL = V1_CONFIG;
-        cliUrl = Utils.getCliUrl('1', '1.2.3', fileName, Utils.extractDownloadDetails('jfrog-cli-remote', {} as JfrogCredentials));
+        cliUrl = Utils.getCliUrl('1.2.3', fileName, Utils.extractDownloadDetails('jfrog-cli-remote', {} as JfrogCredentials));
         expect(cliUrl).toBe(CUSTOM_CLI_URL + expectedUrl);
     });
 });
@@ -189,11 +194,11 @@ describe('JFrog CLI V2 URL Tests', () => {
         myOs.platform.mockImplementation(() => <NodeJS.Platform>platform);
         myOs.arch.mockImplementation(() => arch);
 
-        let cliUrl: string = Utils.getCliUrl('2', '2.3.4', fileName, Utils.extractDownloadDetails('', {} as JfrogCredentials));
+        let cliUrl: string = Utils.getCliUrl('2.3.4', fileName, Utils.extractDownloadDetails('', {} as JfrogCredentials));
         expect(cliUrl).toBe(DEFAULT_CLI_URL + expectedUrl);
 
         process.env.JF_ENV_LOCAL = V2_CONFIG;
-        cliUrl = Utils.getCliUrl('2', '2.3.4', fileName, Utils.extractDownloadDetails('jfrog-cli-remote', {} as JfrogCredentials));
+        cliUrl = Utils.getCliUrl('2.3.4', fileName, Utils.extractDownloadDetails('jfrog-cli-remote', {} as JfrogCredentials));
         expect(cliUrl).toBe(CUSTOM_CLI_URL + expectedUrl);
     });
 });
@@ -240,4 +245,154 @@ test('User agent', () => {
     expect(split).toHaveLength(2);
     expect(split[0]).toBe('setup-jfrog-cli-github-action');
     expect(split[1]).toMatch(/\d*.\d*.\d*/);
+});
+
+describe('extractTokenUser', () => {
+    it('should extract user from subject starting with jfrt@', () => {
+        const subject: string = 'jfrt@/users/johndoe';
+        const result: string = Utils.extractTokenUser(subject);
+        expect(result).toBe('johndoe');
+    });
+
+    it('should extract user from subject containing /users/', () => {
+        const subject: string = '/users/johndoe';
+        const result: string = Utils.extractTokenUser(subject);
+        expect(result).toBe('johndoe');
+    });
+
+    it('should return original subject when it does not start with jfrt@ or contain /users/', () => {
+        const subject: string = 'johndoe';
+        const result: string = Utils.extractTokenUser(subject);
+        expect(result).toBe(subject);
+    });
+
+    it('should handle empty subject', () => {
+        const subject: string = '';
+        const result: string = Utils.extractTokenUser(subject);
+        expect(result).toBe(subject);
+    });
+});
+
+describe('decodeOidcToken', () => {
+    it('should decode valid OIDC token', () => {
+        const oidcToken: string =
+            Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64') +
+            '.eyJzdWIiOiJ0ZXN0In0.' +
+            Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64');
+        const result: JWTTokenData = Utils.decodeOidcToken(oidcToken);
+        expect(result).toEqual({ sub: 'test' });
+    });
+
+    it('should throw error for OIDC token with invalid format', () => {
+        const oidcToken: string = 'invalid.token.format';
+        expect(() => Utils.decodeOidcToken(oidcToken)).toThrow(SyntaxError);
+    });
+
+    it('should throw error for OIDC token without subject', () => {
+        const oidcToken: string =
+            Buffer.from(JSON.stringify({ notSub: 'test' })).toString('base64') +
+            '.eyJub3RTdWIiOiJ0ZXN0In0.' +
+            Buffer.from(JSON.stringify({ notSub: 'test' })).toString('base64');
+        expect(() => Utils.decodeOidcToken(oidcToken)).toThrow('OIDC invalid access token format');
+    });
+});
+
+describe('Job Summaries', () => {
+    describe('Job summaries sanity', () => {
+        it('should not crash if no files were found', async () => {
+            expect(async () => await Utils.setMarkdownAsJobSummary()).not.toThrow();
+        });
+    });
+    describe('Command Summaries Disable Flag', () => {
+        const myCore: jest.Mocked<typeof core> = core as any;
+        beforeEach(() => {
+            delete process.env[Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV];
+            delete process.env.RUNNER_TEMP;
+        });
+
+        it('should not set JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR if disable-job-summary is true', () => {
+            myCore.getBooleanInput = jest.fn().mockImplementation(() => {
+                return true;
+            });
+            Utils.setCliEnv();
+            expect(process.env[Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV]).toBeUndefined();
+        });
+
+        it('should set JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR if disable-job-summary is false', () => {
+            process.env.RUNNER_TEMP = '/tmp';
+            myCore.getBooleanInput = jest.fn().mockImplementation(() => {
+                return false;
+            });
+            myCore.exportVariable = jest.fn().mockImplementation((name: string, val: string) => {
+                process.env[name] = val;
+            });
+            Utils.setCliEnv();
+            expect(process.env[Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV]).toBe('/tmp');
+        });
+
+        it('should handle self-hosted machines and set JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR based on OS temp dir', () => {
+            // Mock os.tmpdir() to simulate different OS temp directories
+            const tempDir: string = '/mocked-temp-dir';
+            jest.spyOn(os, 'tmpdir').mockReturnValue(tempDir);
+
+            myCore.getBooleanInput = jest.fn().mockImplementation(() => {
+                return false;
+            });
+            myCore.exportVariable = jest.fn().mockImplementation((name: string, val: string) => {
+                process.env[name] = val;
+            });
+
+            Utils.setCliEnv();
+
+            expect(process.env[Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV]).toBe(tempDir);
+        });
+
+        it('Should throw error when failing to get temp dir', () => {
+            // Mock os.tmpdir() to return an empty string
+            jest.spyOn(os, 'tmpdir').mockReturnValue('');
+
+            myCore.getBooleanInput = jest.fn().mockImplementation(() => {
+                return false;
+            });
+            myCore.exportVariable = jest.fn().mockImplementation((name: string, val: string) => {
+                process.env[name] = val;
+            });
+
+            // Expect the function to throw an error
+            expect(() => Utils.setCliEnv()).toThrow('Failed to determine the temporary directory');
+
+            // Restore the mock to avoid affecting other tests
+            jest.restoreAllMocks();
+        });
+    });
+});
+
+describe('isJobSummarySupported', () => {
+    const MIN_CLI_VERSION_JOB_SUMMARY: string = '2.66.0';
+    const LATEST_CLI_VERSION: string = 'latest';
+
+    beforeEach(() => {
+        jest.resetAllMocks();
+    });
+
+    it('should return true if the version is the latest', () => {
+        jest.spyOn(core, 'getInput').mockReturnValue(LATEST_CLI_VERSION);
+        expect(Utils.isJobSummarySupported()).toBe(true);
+    });
+
+    it('should return true if the version is greater than or equal to the minimum supported version', () => {
+        const version: string = '2.66.0';
+        jest.spyOn(core, 'getInput').mockReturnValue(version);
+        (semver.gte as jest.Mock).mockReturnValue(true);
+        expect(Utils.isJobSummarySupported()).toBe(true);
+        expect(semver.gte).toHaveBeenCalledWith(version, MIN_CLI_VERSION_JOB_SUMMARY);
+    });
+
+    it('should return false if the version is less than the minimum supported version', () => {
+        const version: string = '2.65.0';
+        jest.spyOn(core, 'getInput').mockReturnValue(version);
+        (semver.gte as jest.Mock).mockReturnValue(false);
+        expect(Utils.isJobSummarySupported()).toBe(false);
+        expect(semver.gte).toHaveBeenCalledWith(version, MIN_CLI_VERSION_JOB_SUMMARY);
+    });
 });

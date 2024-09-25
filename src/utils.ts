@@ -1,12 +1,18 @@
 import * as core from '@actions/core';
-import { exec } from '@actions/exec';
+import { exec, ExecOptions, ExecOutput, getExecOutput } from '@actions/exec';
 import { HttpClient, HttpClientResponse } from '@actions/http-client';
 import * as toolCache from '@actions/tool-cache';
-import { chmodSync } from 'fs';
+import { chmodSync, existsSync, promises as fs } from 'fs';
 import { OutgoingHttpHeaders } from 'http';
-import { arch, platform } from 'os';
+import { arch, platform, tmpdir } from 'os';
+import * as path from 'path';
 import { join } from 'path';
-import { lt } from 'semver';
+import { gte, lt } from 'semver';
+import { Octokit } from '@octokit/core';
+import { OctokitResponse } from '@octokit/types/dist-types/OctokitResponse';
+import * as github from '@actions/github';
+import { gzip } from 'zlib';
+import { promisify } from 'util';
 
 export class Utils {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -25,18 +31,42 @@ export class Utils {
     private static readonly LATEST_CLI_VERSION: string = 'latest';
     // The value in the download URL to set to get the latest version
     private static readonly LATEST_RELEASE_VERSION: string = '[RELEASE]';
+    // Placeholder CLI version to use to keep 'latest' in cache.
+    public static readonly LATEST_SEMVER: string = '100.100.100';
     // The default server id name for separate env config
     public static readonly SETUP_JFROG_CLI_SERVER_ID: string = 'setup-jfrog-cli-server';
+    // Directory name which holds markdown files for the Workflow summary
+    private static readonly JOB_SUMMARY_DIR_NAME: string = 'jfrog-command-summary';
+    // Directory name which holds security command summary files
+    private static readonly SECURITY_DIR_NAME: string = 'security';
+    // Directory name which holds sarifs files for the code scanning tab
+    private static readonly SARIF_REPORTS_DIR_NAME: string = 'sarif-reports';
+    // JFrog CLI command summary output directory environment variable
+    public static readonly JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV: string = 'JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR';
+    // Minimum JFrog CLI version supported for job summary command
+    private static readonly MIN_CLI_VERSION_JOB_SUMMARY: string = '2.66.0';
+    // Code scanning sarif expected file extension.
+    private static readonly CODE_SCANNING_FINAL_SARIF_FILE: string = 'final.sarif';
 
     // Inputs
     // Version input
-    private static readonly CLI_VERSION_ARG: string = 'version';
+    public static readonly CLI_VERSION_ARG: string = 'version';
     // Download repository input
     private static readonly CLI_REMOTE_ARG: string = 'download-repository';
     // OpenID Connect audience input
     private static readonly OIDC_AUDIENCE_ARG: string = 'oidc-audience';
     // OpenID Connect provider_name input
     private static readonly OIDC_INTEGRATION_PROVIDER_NAME: string = 'oidc-provider-name';
+    // Disable Job Summaries feature flag
+    public static readonly JOB_SUMMARY_DISABLE: string = 'disable-job-summary';
+    // Disable auto build info publish feature flag
+    public static readonly AUTO_BUILD_PUBLISH_DISABLE: string = 'disable-auto-build-publish';
+    // URL for the markdown header image
+    // This is hosted statically because its usage is outside the context of the JFrog setup action.
+    // It cannot be linked to the repository, as GitHub serves the image from a CDN,
+    // which gets blocked by the browser, resulting in an empty image.
+    private static MARKDOWN_HEADER_PNG_URL: string = 'https://media.jfrog.com/wp-content/uploads/2024/09/02161430/jfrog-job-summary.svg';
+    private static isSummaryHeaderAccessible: boolean;
 
     /**
      * Retrieves server credentials for accessing JFrog's server
@@ -91,6 +121,13 @@ export class Utils {
         if (jfrogCredentials.username && !jfrogCredentials.accessToken && !jfrogCredentials.password) {
             throw new Error('JF_USER is configured, but the JF_PASSWORD or JF_ACCESS_TOKEN environment variables were not set.');
         }
+        // Mark the credentials as secrets to prevent them from being printed in the logs or exported to other workflows
+        if (jfrogCredentials.accessToken) {
+            core.setSecret(jfrogCredentials.accessToken);
+        }
+        if (jfrogCredentials.password) {
+            core.setSecret(jfrogCredentials.password);
+        }
         return jfrogCredentials;
     }
 
@@ -110,12 +147,15 @@ export class Utils {
         const exchangeUrl: string = jfrogCredentials.jfrogUrl!.replace(/\/$/, '') + '/access/api/v1/oidc/token';
         core.debug('Exchanging GitHub JSON web token with a JFrog access token...');
 
+        let projectKey: string = process.env.JF_PROJECT || '';
+
         const httpClient: HttpClient = new HttpClient();
         const data: string = `{
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
             "subject_token": "${jsonWebToken}",
-            "provider_name": "${oidcProviderName}"
+            "provider_name": "${oidcProviderName}",
+            "project_key": "${projectKey}"
         }`;
 
         const additionalHeaders: OutgoingHttpHeaders = {
@@ -127,7 +167,7 @@ export class Utils {
         const responseJson: TokenExchangeResponseData = JSON.parse(responseString);
         jfrogCredentials.accessToken = responseJson.access_token;
         if (jfrogCredentials.accessToken) {
-            core.setSecret(jfrogCredentials.accessToken);
+            this.outputOidcTokenAndUsername(jfrogCredentials.accessToken);
         }
         if (responseJson.errors) {
             throw new Error(`${JSON.stringify(responseJson.errors)}`);
@@ -135,69 +175,105 @@ export class Utils {
         return jfrogCredentials;
     }
 
-    public static async getAndAddCliToPath(jfrogCredentials: JfrogCredentials) {
-        let version: string = core.getInput(Utils.CLI_VERSION_ARG);
-        let cliRemote: string = core.getInput(Utils.CLI_REMOTE_ARG);
-        let major: string = version.split('.')[0];
-        if (version === Utils.LATEST_CLI_VERSION) {
-            version = Utils.LATEST_RELEASE_VERSION;
-            major = '2';
-        } else if (lt(version, this.MIN_CLI_VERSION)) {
-            throw new Error('Requested to download JFrog CLI version ' + version + ' but must be at least ' + this.MIN_CLI_VERSION);
-        }
+    /**
+     * Output the OIDC access token as a secret and the user from the OIDC access token subject as a secret.
+     * Both are set as secrets to prevent them from being printed in the logs or exported to other workflows.
+     * @param oidcToken access token received from the JFrog platform during OIDC token exchange
+     */
+    private static outputOidcTokenAndUsername(oidcToken: string): void {
+        // Making sure the token is treated as a secret
+        core.setSecret(oidcToken);
+        // Output the oidc access token as a secret
+        core.setOutput('oidc-token', oidcToken);
 
-        let jfFileName: string = Utils.getJfExecutableName();
-        let jfrogFileName: string = Utils.getJFrogExecutableName();
-        if (this.loadFromCache(jfFileName, jfrogFileName, version)) {
-            // Download is not needed
-            return;
-        }
-
-        // Download JFrog CLI
-        let downloadDetails: DownloadDetails = Utils.extractDownloadDetails(cliRemote, jfrogCredentials);
-        let url: string = Utils.getCliUrl(major, version, jfrogFileName, downloadDetails);
-        core.info('Downloading JFrog CLI from ' + url);
-        let downloadDir: string = await toolCache.downloadTool(url, undefined, downloadDetails.auth);
-
-        // Cache 'jf' and 'jfrog' executables
-        await this.cacheAndAddPath(downloadDir, version, jfFileName);
-        await this.cacheAndAddPath(downloadDir, version, jfrogFileName);
+        // Output the user from the oidc access token subject as a secret
+        let payload: JWTTokenData = this.decodeOidcToken(oidcToken);
+        let tokenUser: string = this.extractTokenUser(payload.sub);
+        // Mark the user as a secret
+        core.setSecret(tokenUser);
+        // Output the user from the oidc access token subject extracted from the last section of the subject
+        core.setOutput('oidc-user', tokenUser);
     }
 
     /**
-     * Fetch the JFrog CLI path from the tool cache and append it to the PATH environment variable. Employ this approach during the cleanup phase.
+     * Extract the username from the OIDC access token subject.
+     * @param subject OIDC token subject
+     * @returns the username
      */
-    public static addCachedCliToPath(): boolean {
+    public static extractTokenUser(subject: string): string {
+        // Main OIDC user parsing logic
+        if (subject.startsWith('jfrt@') || subject.includes('/users/')) {
+            let lastSlashIndex: number = subject.lastIndexOf('/');
+            // Return the user extracted from the token
+            return subject.substring(lastSlashIndex + 1);
+        }
+        // No parsing was needed, returning original sub from the token as the user
+        return subject;
+    }
+
+    /**
+     * Decode the OIDC access token and return the payload.
+     * @param oidcToken access token received from the JFrog platform during OIDC token exchange
+     * @returns the payload of the OIDC access token
+     */
+    public static decodeOidcToken(oidcToken: string): JWTTokenData {
+        // Split jfrogCredentials.accessToken into 3 parts divided by .
+        let tokenParts: string[] = oidcToken.split('.');
+        if (tokenParts.length != 3) {
+            // this error should not happen since access only generates valid JWT tokens
+            throw new Error(`OIDC invalid access token format`);
+        }
+        // Decode the second part of the token
+        let base64Payload: string = tokenParts[1];
+        let utf8Payload: string = Buffer.from(base64Payload, 'base64').toString('utf8');
+        let payload: JWTTokenData = JSON.parse(utf8Payload);
+        if (!payload || !payload.sub) {
+            throw new Error(`OIDC invalid access token format`);
+        }
+        return payload;
+    }
+
+    public static async getAndAddCliToPath(jfrogCredentials: JfrogCredentials) {
         let version: string = core.getInput(Utils.CLI_VERSION_ARG);
-        if (version === Utils.LATEST_CLI_VERSION) {
-            version = Utils.LATEST_RELEASE_VERSION;
+        let cliRemote: string = core.getInput(Utils.CLI_REMOTE_ARG);
+        const isLatestVer: boolean = version === Utils.LATEST_CLI_VERSION;
+
+        if (!isLatestVer && lt(version, this.MIN_CLI_VERSION)) {
+            throw new Error('Requested to download JFrog CLI version ' + version + ' but must be at least ' + this.MIN_CLI_VERSION);
         }
-        let jfrogCliPath: string = toolCache.find(Utils.getJfExecutableName(), version);
-        if (!jfrogCliPath) {
-            core.warning(`Could not find JFrog CLI version '${version}' in tool cache`);
-            return false;
+        if (!isLatestVer && this.loadFromCache(version)) {
+            core.info('Found JFrog CLI in cache. No need to download');
+            return;
         }
-        core.addPath(jfrogCliPath);
-        return true;
+        // Download JFrog CLI
+        let downloadDetails: DownloadDetails = Utils.extractDownloadDetails(cliRemote, jfrogCredentials);
+        let url: string = Utils.getCliUrl(version, Utils.getJFrogExecutableName(), downloadDetails);
+        core.info('Downloading JFrog CLI from ' + url);
+        let downloadedExecutable: string = await toolCache.downloadTool(url, undefined, downloadDetails.auth);
+
+        // Cache 'jf' and 'jfrog' executables
+        await this.cacheAndAddPath(downloadedExecutable, version);
     }
 
     /**
      * Try to load the JFrog CLI executables from cache.
      *
-     * @param jfFileName    - 'jf' or 'jf.exe'
-     * @param jfrogFileName - 'jfrog' or 'jfrog.exe'
      * @param version       - JFrog CLI version
      * @returns true if the CLI executable was loaded from cache and added to path
      */
-    private static loadFromCache(jfFileName: string, jfrogFileName: string, version: string): boolean {
-        if (version === Utils.LATEST_RELEASE_VERSION) {
-            return false;
+    public static loadFromCache(version: string): boolean {
+        const jfFileName: string = Utils.getJfExecutableName();
+        const jfrogFileName: string = Utils.getJFrogExecutableName();
+        if (version === Utils.LATEST_CLI_VERSION) {
+            // If the version is 'latest', we keep it on cache as 100.100.100
+            version = Utils.LATEST_SEMVER;
         }
-        let jfExecDir: string = toolCache.find(jfFileName, version);
-        let jfrogExecDir: string = toolCache.find(jfrogFileName, version);
+        const jfExecDir: string = toolCache.find(jfFileName, version);
+        const jfrogExecDir: string = toolCache.find(jfrogFileName, version);
         if (jfExecDir && jfrogExecDir) {
             core.addPath(jfExecDir);
             core.addPath(jfrogExecDir);
+
             return true;
         }
         return false;
@@ -205,24 +281,47 @@ export class Utils {
 
     /**
      * Add JFrog CLI executables to cache and to the system path.
-     * @param downloadDir - The directory whereby the CLI was downloaded to
-     * @param version     - JFrog CLI version
-     * @param fileName    - 'jf', 'jfrog', 'jf.exe', or 'jfrog.exe'
+     * @param downloadedExecutable - Path to the downloaded JFrog CLI executable
+     * @param version              - JFrog CLI version
      */
-    private static async cacheAndAddPath(downloadDir: string, version: string, fileName: string) {
-        let cliDir: string = await toolCache.cacheFile(downloadDir, fileName, fileName, version);
+    private static async cacheAndAddPath(downloadedExecutable: string, version: string) {
+        if (version === Utils.LATEST_CLI_VERSION) {
+            // If the version is 'latest', we keep it on cache as 100.100.100 as GitHub actions cache supports only semver versions
+            version = Utils.LATEST_SEMVER;
+        }
+        const jfFileName: string = Utils.getJfExecutableName();
+        const jfrogFileName: string = Utils.getJFrogExecutableName();
+        let jfCacheDir: string = await toolCache.cacheFile(downloadedExecutable, jfFileName, jfFileName, version);
+        core.addPath(jfCacheDir);
+
+        let jfrogCacheDir: string = await toolCache.cacheFile(downloadedExecutable, jfrogFileName, jfrogFileName, version);
+        core.addPath(jfrogCacheDir);
 
         if (!Utils.isWindows()) {
-            chmodSync(join(cliDir, fileName), 0o555);
+            chmodSync(join(jfCacheDir, jfFileName), 0o555);
+            chmodSync(join(jfrogCacheDir, jfrogFileName), 0o555);
         }
-        core.addPath(cliDir);
     }
 
-    public static getCliUrl(major: string, version: string, fileName: string, downloadDetails: DownloadDetails): string {
-        let architecture: string = 'jfrog-cli-' + Utils.getArchitecture();
-        let artifactoryUrl: string = downloadDetails.artifactoryUrl.replace(/\/$/, '');
+    /**
+     * Get the JFrog CLI download URL.
+     * @param version - Requested version
+     * @param fileName - Executable file name
+     * @param downloadDetails - Source Artifactory details
+     */
+    public static getCliUrl(version: string, fileName: string, downloadDetails: DownloadDetails): string {
+        const architecture: string = 'jfrog-cli-' + Utils.getArchitecture();
+        const artifactoryUrl: string = downloadDetails.artifactoryUrl.replace(/\/$/, '');
+        let major: string;
+        if (version === Utils.LATEST_CLI_VERSION) {
+            version = Utils.LATEST_RELEASE_VERSION;
+            major = '2';
+        } else {
+            major = version.split('.')[0];
+        }
         return `${artifactoryUrl}/${downloadDetails.repository}/v${major}/${version}/${architecture}/${fileName}`;
     }
+
     // Get Config Tokens created on your local machine using JFrog CLI.
     // The Tokens configured with JF_ENV_ environment variables.
     public static getConfigTokens(): Set<string> {
@@ -280,6 +379,26 @@ export class Utils {
             process.env.GITHUB_SERVER_URL + '/' + process.env.GITHUB_REPOSITORY + '/actions/runs/' + process.env.GITHUB_RUN_ID,
         );
         Utils.exportVariableIfNotSet('JFROG_CLI_USER_AGENT', Utils.USER_AGENT);
+
+        // Set JF_PROJECT as JFROG_CLI_BUILD_PROJECT to allow the JFrog CLI to use it as the project key
+        let projectKey: string | undefined = process.env.JF_PROJECT;
+        if (projectKey) {
+            Utils.exportVariableIfNotSet('JFROG_CLI_BUILD_PROJECT', projectKey);
+        }
+
+        // Enable job summaries if disable was not requested.
+        if (!core.getBooleanInput(Utils.JOB_SUMMARY_DISABLE)) {
+            Utils.enableJobSummaries();
+        }
+    }
+
+    /**
+     * Enabling job summary is done by setting the output dir for the summaries.
+     * If the output dir is not set, the CLI won't generate the summary Markdown files.
+     */
+    private static enableJobSummaries() {
+        let tempDir: string = this.getTempDirectory();
+        Utils.exportVariableIfNotSet(Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV, tempDir);
     }
 
     private static exportVariableIfNotSet(key: string, value: string) {
@@ -291,6 +410,8 @@ export class Utils {
     public static async configJFrogServers(jfrogCredentials: JfrogCredentials) {
         let cliConfigCmd: string[] = ['config'];
         for (let configToken of Utils.getConfigTokens()) {
+            // Mark the credentials as secrets to prevent them from being printed in the logs or exported to other workflows
+            core.setSecret(configToken);
             await Utils.runCli(cliConfigCmd.concat('import', configToken));
         }
 
@@ -332,14 +453,40 @@ export class Utils {
     /**
      * Execute JFrog CLI command.
      * This GitHub Action downloads the requested 'jfrog' executable and stores it as 'jfrog' and 'jf'.
-     * Therefore the 'jf' executable is expected to be in the path also for older CLI versions.
+     * Therefore, the 'jf' executable is expected to be in the path also for older CLI versions.
      * @param args - CLI arguments
+     * @param options - Execution options
      */
-    public static async runCli(args: string[]) {
-        let res: number = await exec('jf', args);
+    public static async runCli(args: string[], options?: ExecOptions) {
+        let res: number = await exec('jf', args, { ...options, ignoreReturnCode: true });
         if (res !== core.ExitCode.Success) {
-            throw new Error('JFrog CLI exited with exit code ' + res);
+            throw new Error('JFrog CLI exited with exit code: ' + res);
         }
+    }
+
+    /**
+     * Execute JFrog CLI command and capture its output.
+     * This GitHub Action downloads the requested 'jfrog' executable and stores it as 'jfrog' and 'jf'.
+     * Therefore, the 'jf' executable is expected to be in the path also for older CLI versions.
+     * The command's output is captured and returned as a string.
+     * The command is executed silently, meaning its output will not be printed to the console.
+     * If the command fails (i.e., exits with a non-success code), an error is thrown.
+     * @param args - CLI arguments
+     * @param options
+     * @returns The standard output of the CLI command as a string.
+     * @throws An error if the JFrog CLI command exits with a non-success code.
+     */
+    public static async runCliAndGetOutput(args: string[], options?: ExecOptions): Promise<string> {
+        let output: ExecOutput;
+        output = await getExecOutput('jf', args, { ...options, ignoreReturnCode: true });
+        if (output.exitCode !== core.ExitCode.Success) {
+            if (options?.silent) {
+                core.info(output.stdout);
+                core.info(output.stderr);
+            }
+            throw new Error(`JFrog CLI exited with exit code ${output.exitCode}`);
+        }
+        return output.stdout;
     }
 
     /**
@@ -393,6 +540,226 @@ export class Utils {
         }
         return;
     }
+
+    public static isJobSummarySupported(): boolean {
+        const version: string = core.getInput(Utils.CLI_VERSION_ARG);
+        return version === Utils.LATEST_CLI_VERSION || gte(version, Utils.MIN_CLI_VERSION_JOB_SUMMARY);
+    }
+
+    /**
+     * Generates GitHub workflow unified Summary report.
+     * This function runs as part of post-workflow cleanup function,
+     * collects existing section markdown files generated by the CLI,
+     * and constructs a single Markdown file, to be displayed in the GitHub UI.
+     */
+    public static async setMarkdownAsJobSummary() {
+        try {
+            // Read all sections and construct the final Markdown file
+            const markdownContent: string = await this.readCommandSummaryMarkdown();
+            if (markdownContent.length == 0) {
+                core.debug('No job summary file found. Workflow summary will not be generated.');
+                return;
+            }
+            // Write to GitHub's job summary
+            core.summary.addRaw(markdownContent, true);
+            await core.summary.write({ overwrite: true });
+        } catch (error) {
+            core.warning(`Failed to generate Workflow summary: ${error}`);
+        }
+    }
+
+    /**
+     * Populates the code scanning SARIF (if generated by scan commands) to the code scanning tab in GitHub.
+     */
+    public static async populateCodeScanningTab() {
+        try {
+            const encodedSarif: string = await this.getCodeScanningEncodedSarif();
+            if (!encodedSarif) {
+                return;
+            }
+
+            const token: string | undefined = process.env.JF_GIT_TOKEN;
+            if (!token) {
+                console.info('No token provided for uploading code scanning sarif files.');
+                return;
+            }
+
+            await this.uploadCodeScanningSarif(encodedSarif, token);
+        } catch (error) {
+            core.warning(`Failed populating code scanning sarif: ${error}`);
+        }
+    }
+
+    /**
+     * Uploads the code scanning SARIF content to the code-scanning GitHub API.
+     * @param encodedSarif - The final compressed and encoded sarif content.
+     * @param token - GitHub token to use for the request. Has to have 'security-events: write' permission.
+     * @private
+     */
+    private static async uploadCodeScanningSarif(encodedSarif: string, token: string) {
+        const octokit: Octokit = new Octokit({ auth: token });
+        let response: OctokitResponse<any> | undefined;
+        response = await octokit.request('POST /repos/{owner}/{repo}/code-scanning/sarifs', {
+            owner: github.context.repo.owner,
+            repo: github.context.repo.repo,
+            commit_sha: github.context.sha,
+            ref: github.context.ref,
+            sarif: encodedSarif,
+        });
+
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(`Failed to upload SARIF file: ` + JSON.stringify(response));
+        }
+
+        core.info('SARIF file uploaded successfully');
+    }
+
+    /**
+     * Compresses the input sarif content using gzip and encodes it to base64. This is required by the code-scanning/sarif API.
+     * @param input - The sarif content to compress and encode.
+     * @returns The compressed and encoded string.
+     * @private
+     */
+    private static async compressAndEncodeSarif(input: string): Promise<string> {
+        try {
+            const compressed: Buffer = await promisify(gzip)(input);
+            return compressed.toString('base64');
+        } catch (error) {
+            throw new Error('Compression of sarif file failed: ' + error);
+        }
+    }
+
+    /**
+     * Each section should prepare a file called markdown.md.
+     * This function reads each section file and wraps it with a markdown header
+     * @returns <string> the content of the markdown file as string, warped in a collapsable section.
+     */
+    private static async readCommandSummaryMarkdown(): Promise<string> {
+        let markdownContent: string = await Utils.readMarkdownContent();
+        if (markdownContent === '') {
+            return '';
+        }
+        // Check if the header can be accessed via the internet to decide if to use the image or the text header
+        this.isSummaryHeaderAccessible = await this.isHeaderPngAccessible();
+        core.debug('Header image is accessible: ' + this.isSummaryHeaderAccessible);
+        return Utils.wrapContent(markdownContent);
+    }
+
+    /**
+     * Reads the combined SARIF file, compresses and encodes it to match the code-scanning/sarif API requirements.
+     * @returns <string[]> the paths of the code scanning sarif files.
+     */
+    private static async getCodeScanningEncodedSarif(): Promise<string> {
+        const finalSarifFile: string = path.join(
+            Utils.getJobOutputDirectoryPath(),
+            this.SECURITY_DIR_NAME,
+            this.SARIF_REPORTS_DIR_NAME,
+            this.CODE_SCANNING_FINAL_SARIF_FILE,
+        );
+        if (!existsSync(finalSarifFile)) {
+            console.debug('No code scanning sarif file was found.');
+            return '';
+        }
+
+        // Read the SARIF file, compress and encode it to match the code-scanning/sarif API requirements.
+        const sarif: string = await fs.readFile(finalSarifFile, 'utf-8');
+        return await this.compressAndEncodeSarif(sarif);
+    }
+
+    private static async readMarkdownContent() {
+        const markdownFilePath: string = path.join(Utils.getJobOutputDirectoryPath(), 'markdown.md');
+        if (existsSync(markdownFilePath)) {
+            return await fs.readFile(markdownFilePath, 'utf-8');
+        }
+        core.debug(`No job summary file found. at ${markdownFilePath}.`);
+        return '';
+    }
+
+    private static getMarkdownHeader(): string {
+        let mainTitle: string;
+        if (this.isSummaryHeaderAccessible) {
+            let platformUrl: string = Utils.getPlatformUrl();
+            mainTitle = `[![JFrog Job Summary Header](${this.MARKDOWN_HEADER_PNG_URL})](${platformUrl})` + '\n\n';
+        } else {
+            mainTitle = `# 🐸 JFrog Job Summary` + '\n\n';
+        }
+        return mainTitle + Utils.getProjectPackagesLink();
+    }
+
+    /**
+     * Gets the project packages link to be displayed in the summary
+     * If the project is undefined, it will resolve to 'all' section in the UI.
+     * @return <string> https://platformUrl/ui/packages?projectKey=projectKey
+     */
+    private static getProjectPackagesLink(): string {
+        let platformUrl: string = this.getPlatformUrl();
+        if (!platformUrl) {
+            return '';
+        }
+        let projectKey: string = process.env.JF_PROJECT ? process.env.JF_PROJECT : '';
+        let projectPackagesUrl: string = platformUrl + 'ui/packages';
+        if (projectKey) {
+            projectPackagesUrl += '?projectKey=' + projectKey;
+        }
+        return `<a href="${projectPackagesUrl}"> 🐸 View package details on the JFrog platform  </a>` + '\n\n';
+    }
+
+    private static getPlatformUrl(): string {
+        let platformUrl: string | undefined = process.env.JF_URL;
+        if (!platformUrl) {
+            return '';
+        }
+        if (!platformUrl.endsWith('/')) {
+            platformUrl = platformUrl + '/';
+        }
+        return platformUrl;
+    }
+
+    private static getJobOutputDirectoryPath(): string {
+        const outputDir: string | undefined = process.env[Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV];
+        if (!outputDir) {
+            throw new Error('Jobs home directory is undefined, ' + Utils.JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR_ENV + ' is not set.');
+        }
+        return path.join(outputDir, Utils.JOB_SUMMARY_DIR_NAME);
+    }
+
+    public static async clearCommandSummaryDir() {
+        const outputDir: string = Utils.getJobOutputDirectoryPath();
+        core.debug('Removing command summary directory: ' + outputDir);
+        await fs.rm(outputDir, { recursive: true });
+    }
+
+    private static wrapContent(fileContent: string) {
+        return Utils.getMarkdownHeader() + fileContent + Utils.getMarkdownFooter();
+    }
+
+    private static getMarkdownFooter() {
+        return '\n\n # \n\n The above Job Summary was generated by the <a href="https://github.com/marketplace/actions/setup-jfrog-cli"> Setup JFrog CLI GitHub Action </a>';
+    }
+
+    private static async isHeaderPngAccessible(): Promise<boolean> {
+        const url: string = this.MARKDOWN_HEADER_PNG_URL;
+        const httpClient: HttpClient = new HttpClient();
+        try {
+            const response: HttpClientResponse = await httpClient.head(url);
+            return response.message.statusCode === 200;
+        } catch (error) {
+            core.warning('No internet access to the header image, using the text header instead.');
+            return false;
+        } finally {
+            httpClient.dispose();
+        }
+    }
+
+    private static getTempDirectory(): string {
+        // Determine the temporary directory path, prioritizing RUNNER_TEMP
+        // Runner_Temp is set on GitHub machines, but on self-hosted it could be unset.
+        const tempDir: string = process.env.RUNNER_TEMP || tmpdir();
+        if (!tempDir) {
+            throw new Error('Failed to determine the temporary directory');
+        }
+        return tempDir;
+    }
 }
 
 export interface DownloadDetails {
@@ -400,6 +767,7 @@ export interface DownloadDetails {
     repository: string;
     auth: string;
 }
+
 export interface JfrogCredentials {
     jfrogUrl: string | undefined;
     username: string | undefined;
@@ -410,4 +778,14 @@ export interface JfrogCredentials {
 export interface TokenExchangeResponseData {
     access_token: string;
     errors: string;
+}
+
+export interface JWTTokenData {
+    sub: string;
+    scp: string;
+    aud: string;
+    iss: string;
+    exp: bigint;
+    iat: bigint;
+    jti: string;
 }
